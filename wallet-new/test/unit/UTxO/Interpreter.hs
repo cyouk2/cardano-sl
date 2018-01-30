@@ -4,8 +4,10 @@
 module UTxO.Interpreter (
     -- * Translate the DSL to Cardano types
     Interpret(..)
+  , intTopId
   , IntException(..)
-  , runInterpret
+  , IntM
+  , runIntM
     -- * Convenience re-exports
   , SlotId(..)
   ) where
@@ -38,14 +40,9 @@ import qualified UTxO.DSL as DSL
   <cardano-sl-articles/delegation/pdf/article.pdf>.
 -------------------------------------------------------------------------------}
 
-newtype PrettyCallStack = PrettyCallStack CallStack
-
-instance Show PrettyCallStack where
-  show (PrettyCallStack cs) = prettyCallStack cs
-
 -- | Interpretation error
 data IntException =
-    IntExNonOrdinaryAddress PrettyCallStack
+    IntExNonOrdinaryAddress
   | IntExClassifyInputs Text
   | IntExMkDlg          Text
   | IntExCreateBlock    Text
@@ -55,35 +52,43 @@ data IntException =
 
 instance Exception IntException
 
-class Interpret a where
+-- | Interpretation context
+--
+-- In order to interpret an input, we need the context (the ledger) in order
+-- to resolve transaction hashes. See also 'int'.
+type IntCtxt h = DSL.Ledger h Addr
+
+-- | Interpretation monad
+type IntM a = Translate IntException a
+
+-- | Run the interpreter monad
+runIntM :: IntM a -> a
+runIntM = runTranslate
+
+-- | Interpretation of the UTxO DSL
+class Interpret h a where
   type Interpreted a :: *
 
-  int :: HasCallStack => a -> Translate IntException (Interpreted a)
+  int :: IntCtxt h -> a -> IntM (Interpreted a)
 
--- | Specialization of 'runTranslate' (just to fix the types)
-runInterpret :: Translate IntException a -> a
-runInterpret = runTranslate
+-- | Run interpreter in the empty context
+--
+-- Specific to Identity otherwise we get unresolved type variables.
+intTopId :: Interpret Identity a => a -> IntM (Interpreted a)
+intTopId = int (DSL.ledgerEmpty :: DSL.Ledger Identity Addr)
 
-instance Interpret Addr where
+instance Interpret h Addr where
   type Interpreted Addr = (SomeKeyPair, Address)
 
-  int :: Addr -> Translate IntException (SomeKeyPair, Address)
-  int = asks . resolveAddr
+  int :: IntCtxt h -> Addr -> IntM (SomeKeyPair, Address)
+  int _l = asks . resolveAddr
 
-instance Interpret a => Interpret (DSL.Address a) where
-  type Interpreted (DSL.Address a) = Interpreted a
+instance InterpretHash h => Interpret h (DSL.Input h Addr) where
+  type Interpreted (DSL.Input h Addr) = TxOwnedInput SomeKeyPair
 
-  int :: HasCallStack => DSL.Address a -> Translate IntException (Interpreted a)
-  int (DSL.AddrOrdinary addr) = int addr
-  int _ = throwError $ IntExNonOrdinaryAddress (PrettyCallStack ?callStack)
-
-instance Interpret (DSL.Input Addr) where
-  type Interpreted (DSL.Input Addr) = TxOwnedInput SomeKeyPair
-
-  int :: HasCallStack
-      => DSL.Input Addr -> Translate IntException (TxOwnedInput SomeKeyPair)
-  int inp@(DSL.Input t _ix) | isBootstrapTransaction t = do
-      (ownerKey, ownerAddr) <- int $ DSL.outAddr (DSL.out inp)
+  int :: IntCtxt h -> DSL.Input h Addr -> IntM (TxOwnedInput SomeKeyPair)
+  int l inp@(DSL.Input t _ix) | isBootstrapTransaction (DSL.findHash' l t) = do
+      (ownerKey, ownerAddr) <- int l $ DSL.outAddr (DSL.inpSpentOutput' l inp)
       -- See explanation at 'bootstrapTransaction'
       return (
             ownerKey
@@ -92,10 +97,10 @@ instance Interpret (DSL.Input Addr) where
               , txInIndex = 0
               }
           )
-  int inp@DSL.Input{..} = do
+  int l inp@DSL.Input{..} = do
       -- We figure out who must sign the input by looking at the output
-      (ownerKey, _) <- int $ DSL.outAddr (DSL.out inp)
-      inpTrans'     <- (hash . taTx) <$> int inpTrans
+      (ownerKey, _) <- int     l $ DSL.outAddr (DSL.inpSpentOutput' l inp)
+      inpTrans'     <- intHash l $ inpTrans
       return (
             ownerKey
           , TxInUtxo {
@@ -104,12 +109,12 @@ instance Interpret (DSL.Input Addr) where
               }
           )
 
-instance Interpret (DSL.Output Addr) where
+instance Interpret h (DSL.Output Addr) where
   type Interpreted (DSL.Output Addr) = TxOutAux
 
-  int :: HasCallStack => DSL.Output Addr -> Translate IntException TxOutAux
-  int DSL.Output{..} = do
-      (_, outAddr') <- int outAddr
+  int :: IntCtxt h -> DSL.Output Addr -> IntM TxOutAux
+  int l DSL.Output{..} = do
+      (_, outAddr') <- int l outAddr
       return TxOutAux {
           toaOut = TxOut {
               txOutAddress = outAddr'
@@ -118,13 +123,13 @@ instance Interpret (DSL.Output Addr) where
         }
 
 -- | Interpretation of transactions
-instance Interpret (DSL.Transaction Addr) where
-  type Interpreted (DSL.Transaction Addr) = TxAux
+instance InterpretHash h => Interpret h (DSL.Transaction h Addr) where
+  type Interpreted (DSL.Transaction h Addr) = TxAux
 
-  int :: HasCallStack => DSL.Transaction Addr -> Translate IntException TxAux
-  int DSL.Transaction{..} = do
-      trIns'  <- mapM int $ trIns
-      trOuts' <- mapM int $ filter (not . DSL.outputIsFee) trOuts
+  int :: IntCtxt h -> DSL.Transaction h Addr -> IntM TxAux
+  int l t = do
+      trIns'  <- mapM (int l) $ DSL.trIns' t
+      trOuts' <- mapM (int l) $ DSL.trOuts t
       case classifyInputs trIns' of
         Left err ->
           throwError (IntExClassifyInputs err)
@@ -139,96 +144,115 @@ instance Interpret (DSL.Transaction Addr) where
             (NE.fromList [inp])
             (NE.fromList trOuts')
 
--- | Interpretation of a block
+-- | Interpretation of a list of transactions, oldest first
 --
--- NOTE:
+-- Each transaction becomes part of the context for the next.
+instance InterpretHash h => Interpret h (DSL.Block h Addr) where
+  type Interpreted (DSL.Block h Addr) = OldestFirst [] TxAux
+
+  int :: IntCtxt h -> DSL.Block h Addr -> IntM (OldestFirst [] TxAux)
+  int = \l ts -> (OldestFirst . snd) <$> go l (toList ts)
+    where
+      go :: IntCtxt h -> [DSL.Transaction h Addr] -> IntM (IntCtxt h, [TxAux])
+      go l []     = return (l, [])
+      go l (t:ts) = do
+          t' <- int l t
+          second (t':) <$> go (DSL.ledgerAdd t l) ts
+
+-- | Interpretation of a list of list of transactions (basically a chain)
 --
--- * We don't test the shared seed computation
--- * We stay within a single epoch for now
--- * We use the genesis block from the test configuration
---   (which has implications for which slot leaders etc we have)
-instance Interpret (DSL.Block SlotId Addr) where
-  type Interpreted (DSL.Block SlotId Addr) = MainBlock
+-- Each list becomes part of the context for the next.
+instance InterpretHash h => Interpret h (DSL.Blocks h Addr) where
+  type Interpreted (DSL.Blocks h Addr) = OldestFirst [] (OldestFirst [] TxAux)
 
-  int :: HasCallStack
-      => DSL.Block SlotId Addr -> Translate IntException MainBlock
-  int DSL.Block{..} = do
-      blockTrans' <- mapM int blockTrans
-
-      -- empty delegation payload
-      dlgPayload <- mapTranslateErrors IntExMkDlg $
-                      withConfig $ mkDlgPayload []
-
-      -- empty update payload
-      let updPayload = def
-
-      -- previous block header
-      -- if none specified, use genesis block
-      prev <-
-        case blockPrev of
-          Just block -> (Right . view gbHeader) <$> int block
-          Nothing    -> (Left  . view gbHeader) <$> asks (ccBlock0 . tcCardano)
-
-      -- figure out who needs to sign the block
-      BlockSignInfo{..} <- asks $ blockSignInfoForSlot blockSId
-
-      mapTranslateErrors IntExCreateBlock $
-        withConfig $ createMainBlockPure
-          blockSizeLimit
-          prev
-          (Just (bsiPSK, bsiLeader))
-          blockSId
-          bsiKey
-          (RawPayload
-              blockTrans'
-              (defaultSscPayload (siSlot blockSId))
-              dlgPayload
-              updPayload
-            )
+  int :: IntCtxt h
+      -> DSL.Blocks h Addr -> IntM (OldestFirst [] (OldestFirst [] TxAux))
+  int = \l tss -> (OldestFirst . snd) <$> go l (toList tss)
     where
-      blockSizeLimit = 1 * 1024 * 1024 -- 1 MB
+      go :: IntCtxt h
+         -> [DSL.Block h Addr]
+         -> IntM (IntCtxt h, [OldestFirst [] TxAux])
+      go l []       = return (l, [])
+      go l (ts:tss) = do
+          ts' <- int l ts
+          second (ts':) <$> go (DSL.ledgerAdds (toNewestFirst ts) l) tss
 
-instance Interpret (DSL.Chain Addr) where
-  type Interpreted (DSL.Chain Addr) = OldestFirst NE Block
+-- TODO: Here and elsewhere we assume we stay within a single epoch
+instance InterpretHash h => Interpret h (DSL.Chain h Addr) where
+  type Interpreted (DSL.Chain h Addr) = OldestFirst [] Block
 
-  int :: HasCallStack
-      => DSL.Chain Addr -> Translate IntException (OldestFirst NE Block)
-  int DSL.Chain{..} = do
-      blocks <- (OldestFirst . NE.fromList) <$> mkBlocks Nothing 0 chainBlocks
-      mapM (liftM Right . int) blocks
+  int :: IntCtxt h -> DSL.Chain h Addr -> IntM (OldestFirst [] Block)
+  int = \l DSL.Chain{..} -> do
+      tss <- int l chainBlocks
+      OldestFirst <$> mkBlocks Nothing 0 (toList (map toList tss))
     where
-      -- TODO: Here (and elsewhere) we assume we stay within the first epoch
-      mkBlocks :: Maybe (DSL.Block SlotId Addr)
-               -> Word16
-               -> [[DSL.Transaction Addr]]
-               -> Translate IntException [DSL.Block SlotId Addr]
+      mkBlocks :: Maybe MainBlock -> Word16 -> [[TxAux]] -> IntM [Block]
       mkBlocks _    _    []       = return []
       mkBlocks prev slot (ts:tss) = do
           lsi <- mapTranslateErrors IntExMkSlot $
                    withConfig $ mkLocalSlotIndex slot
-          let block = DSL.Block {
-                          blockPrev  = prev
-                        , blockTrans = ts
-                        , blockSId   = SlotId {
-                              siEpoch = EpochIndex 0
-                            , siSlot  = lsi
-                            }
-                        }
-          (block :) <$> mkBlocks (Just block) (slot + 1) tss
+          let slotId = SlotId (EpochIndex 0) lsi
+          block <- mkBlock prev slotId ts
+          (Right block :) <$> mkBlocks (Just block) (slot + 1) tss
 
--- | This filters out any payments to the treasury
-instance Interpret (DSL.Utxo Addr) where
-  type Interpreted (DSL.Utxo Addr) = Utxo
+      mkBlock :: Maybe MainBlock -> SlotId -> [TxAux] -> IntM MainBlock
+      mkBlock mPrev slotId ts = do
+        -- empty delegation payload
+        dlgPayload <- mapTranslateErrors IntExMkDlg $
+                        withConfig $ mkDlgPayload []
 
-  int :: HasCallStack => DSL.Utxo Addr -> Translate IntException Utxo
-  int = fmap Map.fromList
-      . mapM aux
-      . filter (not . DSL.outputIsFee . snd)
-      . DSL.utxoToList
+        -- empty update payload
+        let updPayload = def
+
+        -- previous block header
+        -- if none specified, use genesis block
+        prev <-
+          case mPrev of
+            Just prev -> (Right . view gbHeader) <$> return prev
+            Nothing   -> (Left  . view gbHeader) <$> asks (ccBlock0 . tcCardano)
+
+        -- figure out who needs to sign the block
+        BlockSignInfo{..} <- asks $ blockSignInfoForSlot slotId
+
+        mapTranslateErrors IntExCreateBlock $
+          withConfig $ createMainBlockPure
+            blockSizeLimit
+            prev
+            (Just (bsiPSK, bsiLeader))
+            slotId
+            bsiKey
+            (RawPayload
+                (toList ts)
+                (defaultSscPayload (siSlot slotId)) -- TODO
+                dlgPayload
+                updPayload
+              )
+
+      -- TODO: Get this value from somewhere rather than hardcoding it
+      blockSizeLimit = 2 * 1024 * 1024 -- 2 MB
+
+instance InterpretHash h => Interpret h (DSL.Utxo h Addr) where
+  type Interpreted (DSL.Utxo h Addr) = Utxo
+
+  int :: IntCtxt h -> DSL.Utxo h Addr -> IntM Utxo
+  int l = fmap Map.fromList . mapM aux . DSL.utxoToList
     where
-      aux :: (DSL.Input Addr, DSL.Output Addr)
-          -> Translate IntException (TxIn, TxOutAux)
+      aux :: (DSL.Input h Addr, DSL.Output Addr) -> IntM (TxIn, TxOutAux)
       aux (inp, out) = do
-          (_key, inp') <- int inp
-          out'         <- int out
+          (_key, inp') <- int l inp
+          out'         <- int l out
           return (inp', out')
+
+{-------------------------------------------------------------------------------
+  Hashing
+-------------------------------------------------------------------------------}
+
+-- | Interpret a hash as TxId
+--
+-- NOTE: See <http://cardano-dev.askbot.com/question/11/why-transactions-dont-include-witnesses/>
+-- for why 'TxId' is @Hash Tx@ rather than @Hash TxAux@.
+class DSL.Hash h Addr => InterpretHash h where
+  intHash :: IntCtxt h -> h (DSL.Transaction h Addr) -> IntM TxId
+
+instance InterpretHash Identity where
+  intHash l (Identity t) = (hash . taTx) <$> int l t

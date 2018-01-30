@@ -6,7 +6,7 @@
 -- * Function 'Pos.Client.Txp.Util.stabilizeTxFee'
 module UTxO.Fees (
     Fee
-  , calculateFees
+  , calcFees
   ) where
 
 import Universum
@@ -14,6 +14,7 @@ import Universum
 import Pos.Core
 import Pos.Client.Txp
 import Pos.Txp.Toil
+import Pos.Util.Chrono
 
 import UTxO.Context
 import UTxO.DSL
@@ -63,13 +64,26 @@ type Fee = Value
 --   is that initially we cannot even know how many transactions the function
 --   returns, and hence we just provide an infinite list of zeroes.
 --   (We could address this at the type level by using vectors.)
-calculateFees :: ([[Fee]] -> [[Transaction Addr]])
-              -> Translate IntException [[Transaction Addr]]
-calculateFees f = do
-    txs <- mapM (mapM int) (f (repeat [0..]))
+--
+-- TODO: We should check that the fees of the constructed transactions match the
+-- fees we calculuated. This ought to be true at the moment, but may break when
+-- the size of the fee might change the size of the the transaction.
+--
+-- TODO: Generalize away from Identity.
+calcFees :: ([[Fee]] -> Blocks Identity Addr) -> IntM (Blocks Identity Addr)
+calcFees f = do
     TxFeePolicyTxSizeLinear policy <- bvdTxFeePolicy <$> gsAdoptedBVData
-    fees <- mapTranslateErrors IntExTx $ mapM (mapM (txToLinearFee policy)) txs
-    return $ f (map (map feeValue) fees)
+    let txToLinearFee' :: TxAux -> IntM Value
+        txToLinearFee' = mapTranslateErrors IntExTx
+                       . fmap feeValue
+                       . txToLinearFee policy
+
+    txs  <- intTopId (f (repeat [0..]))
+    fees <- mapM (mapM txToLinearFee') txs
+    return $ f (unmarkOldestFirst fees)
   where
+    unmarkOldestFirst :: OldestFirst [] (OldestFirst [] a) -> [[a]]
+    unmarkOldestFirst = map toList . toList
+
     feeValue :: TxFee -> Value
     feeValue (TxFee fee) = unsafeGetCoin fee
