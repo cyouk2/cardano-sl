@@ -273,7 +273,8 @@ createWalletSafe cid wsMeta isReady = do
     curTime <- liftIO getPOSIXTime
     createWallet db cid wsMeta isReady curTime
     -- Return the newly created wallet irrespective of whether it's ready yet
-    getWalletIncludeUnready ws True cid
+    ws' <- getWalletSnapshot db
+    getWalletIncludeUnready ws' True cid
 
 
 ----------------------------------------------------------------------------
