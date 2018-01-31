@@ -11,20 +11,21 @@ module Pos.Wallet.Web.State.Transactions
     )
     where
 
-import           Universum                    hiding (for_)
+import           Universum                       hiding (for_)
 
-import           Data.Foldable                (for_)
-import qualified Data.HashMap.Strict          as HM
-import qualified Data.Map                     as M
-import           Pos.Client.Txp.History       (TxHistoryEntry)
-import           Pos.Txp                      (TxId, UtxoModifier)
-import           Pos.Types                    (HeaderHash)
-import           Pos.Util.Servant             (encodeCType)
-import           Pos.Wallet.Web.ClientTypes   (AccountId (..), Addr, CAccountMeta, CId,
-                                               CTxId, CTxMeta, CWAddressMeta (..), Wal)
-import           Pos.Wallet.Web.Pending.Types (PtxCondition)
-import           Pos.Wallet.Web.State.Storage (Update)
-import qualified Pos.Wallet.Web.State.Storage as WS
+import           Data.Foldable                   (for_)
+import qualified Data.HashMap.Strict             as HM
+import qualified Data.Map                        as M
+import           Pos.Client.Txp.History          (TxHistoryEntry)
+import           Pos.Core.Configuration.Protocol (HasProtocolConstants)
+import           Pos.Txp                         (TxId, UtxoModifier)
+import           Pos.Types                       (HeaderHash)
+import           Pos.Util.Servant                (encodeCType)
+import           Pos.Wallet.Web.ClientTypes      (AccountId (..), Addr, CAccountMeta, CId,
+                                                  CTxId, CTxMeta, CWAddressMeta (..), Wal)
+import           Pos.Wallet.Web.Pending.Types    (PtxCondition)
+import           Pos.Wallet.Web.State.Storage    (Update)
+import qualified Pos.Wallet.Web.State.Storage    as WS
 
 -- | Create an account with an address.
 createAccountWithAddress
@@ -78,7 +79,8 @@ applyModifierToWallet walId wAddrs custAddrs utxoMod
 -- | Rollback some set of modifiers to a wallet.
 --   TODO Find out the significance of this set of modifiers and document.
 rollbackModifierFromWallet
-    :: CId Wal
+    :: HasProtocolConstants -- Needed for ptxUpdateMeta
+    => CId Wal
     -> [CWAddressMeta] -- ^ Addresses to remove
     -> [(WS.CustomAddressType, [(CId Addr, HeaderHash)])] -- ^ Custom addresses to remove
     -> UtxoModifier

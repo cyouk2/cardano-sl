@@ -196,7 +196,7 @@ instance Default WalletStorage where
         }
 
 type Query a = forall m. (MonadReader WalletStorage m) => m a
-type Update a = forall m. (HasProtocolConstants, MonadState WalletStorage m) => m a
+type Update a = forall m. (MonadState WalletStorage m) => m a
 
 -- | How to lookup addresses of account
 data AddressLookupMode
@@ -508,7 +508,7 @@ data PtxMetaUpdate
     | PtxMarkAcknowledged
 
 -- | For simple atomic updates of meta info
-ptxUpdateMeta :: CId Wal -> TxId -> PtxMetaUpdate -> Update ()
+ptxUpdateMeta :: HasProtocolConstants => CId Wal -> TxId -> PtxMetaUpdate -> Update ()
 ptxUpdateMeta wid txId updType =
     wsWalletInfos . ix wid . wsPendingTxs . ix txId %=
         case updType of
