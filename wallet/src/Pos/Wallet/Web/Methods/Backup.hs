@@ -32,10 +32,9 @@ import           Pos.Wallet.Web.Tracking      (syncWalletOnImport)
 
 restoreWalletFromBackup :: MonadWalletWebMode m => WalletBackup -> m CWallet
 restoreWalletFromBackup WalletBackup {..} = do
-    ws <- askWalletSnapshot
     let wId = encToCId wbSecretKey
-        wExists = isJust $ getWalletMeta ws wId
 
+    wExists <- isJust . flip getWalletMeta wId <$> askWalletSnapshot
     if wExists
         then do
             throwM $ RequestError "Wallet with id already exists"
@@ -53,6 +52,7 @@ restoreWalletFromBackup WalletBackup {..} = do
             -- may not be what we want.
             db <- askWalletDB
             for_ accList $ \(idx, meta) -> do
+                ws <- getWalletSnapshot db
                 let aIdx = fromInteger $ fromIntegral idx
                     seedGen = DeterminedSeed aIdx
                 accId <- genUniqueAccountId ws seedGen wId
