@@ -306,19 +306,24 @@ handleRequestedHeaders
     -> NewestFirst NE BlockHeader
     -> m ()
 handleRequestedHeaders cont inRecovery headers = do
+
     -- Try to calculate LRC for the oldest header epoch. If we're in
     -- recovery and oldest header is from the next epoch, no lrc will
     -- be automatically calculated as all workers are locked in
     -- recovery mode. So we should try to do it manually.
     tryCalculateLrc
 
+    -- 'classifyHeaders' will verify the headers.
+    -- NB: it means we have duplicated verification. If the header is valid,
+    -- we'll validate it again when we request its block. It was always this
+    -- way, though, when verification was in the 'Bi' instance 'decode'.
     classificationRes <- classifyHeaders inRecovery headers
     case classificationRes of
         CHsValid lcaChild -> do
             let lcaHash = lcaChild ^. prevBlockL
             let headers' = NE.takeWhile ((/= lcaHash) . headerHash)
                                         (getNewestFirst headers)
-            logDebug $ sformat validFormat (headerHash lcaChild)newestHash
+            logDebug $ sformat validFormat (headerHash lcaChild) newestHash
             case nonEmpty headers' of
                 Nothing ->
                     throwM $ BlockNetLogicInternal $
@@ -331,7 +336,8 @@ handleRequestedHeaders cont inRecovery headers = do
             logDebug msg
             throwM $ DialogUnexpected msg
         CHsInvalid reason -> do
-             -- TODO: ban node for sending invalid block.
+             -- TODO: ban node for sending invalid block header.
+             -- TODO: really? How draconian. Maybe it made an honest mistake.
             let msg = sformat invalidFormat oldestHash newestHash reason
             logDebug msg
             throwM $ DialogUnexpected msg
@@ -455,8 +461,10 @@ handleBlocks nodeId blocks enqueue = do
     inAssertMode $ logInfo $
         sformat ("Processing sequence of blocks: " % buildListBounds % "...") $
             getOldestFirst $ map headerHash blocks
-    maybe onNoLca (handleBlocksWithLca nodeId enqueue blocks) =<<
-        lcaWithMainChain (map (view blockHeader) blocks)
+    mLca <- lcaWithMainChain (map (view blockHeader) blocks)
+    case mLca of
+        Nothing -> onNoLca
+        Just lca -> handleBlocksWithLca nodeId enqueue blocks lca
     inAssertMode $ logDebug $ "Finished processing sequence of blocks"
   where
     onNoLca = logWarning $
