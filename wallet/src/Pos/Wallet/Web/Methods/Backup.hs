@@ -27,7 +27,8 @@ import           Pos.Wallet.Web.ClientTypes   (CFilePath (..), CId, CWallet, Wal
 import           Pos.Wallet.Web.Error         (WalletError (..))
 import qualified Pos.Wallet.Web.Methods.Logic as L
 import           Pos.Wallet.Web.Mode          (MonadWalletWebMode)
-import           Pos.Wallet.Web.State         (askWalletDB, createAccount, getWalletMeta, askWalletSnapshot)
+import           Pos.Wallet.Web.State         ( askWalletDB, getWalletSnapshot, createAccount
+                                              , getWalletMeta, askWalletSnapshot)
 import           Pos.Wallet.Web.Tracking      (syncWalletOnImport)
 
 restoreWalletFromBackup :: MonadWalletWebMode m => WalletBackup -> m CWallet
